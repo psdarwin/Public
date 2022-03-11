@@ -1,5 +1,4 @@
-Function Get-LastBoot
-{
+Function Get-LastBoot {
     <#
     .SYNOPSIS
     RETRIEVE COMPUTER BOOT INFORMATION
@@ -12,15 +11,18 @@ Function Get-LastBoot
         etc.
 
     .PARAMETER ComputerName
-    The name of the computer
+    The name of the computer or computers
+
+    .PARAMETER Credential
+    Credential object to use to retrieve data
 
     .EXAMPLE
-    Get-NRECALastBoot -ComputerName SERVER
+    Get-LastBoot -ComputerName SERVER
     This example returns boot time information for SERVER
 
     .EXAMPLE
-    Get-NRECALastBoot -ComputerName SERVER1,SERVER2,SERVER3
-    This example returns boot time information for the listed servers
+    Get-LastBoot -ComputerName SERVER1,SERVER2,SERVER3 -Credential $Cred
+    This example returns boot time information for the listed servers using the given credentials
 
     .INPUTS
     Parameters only
@@ -36,53 +38,66 @@ Function Get-LastBoot
         PositionalBinding = $false
     )]
     Param(
-        [Parameter(ValueFromPipeline, ValueFromPipelineByPropertyName, Position = 0, ParameterSetName = 'Name')]
-        [alias("Name")]
-        [alias("PSComputerName")]
-        [string[]]$ComputerName
+        [Parameter(ValueFromPipeline, Position = 0, ParameterSetName = 'Name')]
+            [alias("Name")]
+            [alias("PSComputerName")]
+            [string[]]$ComputerName,
+        [Parameter()]
+            [System.Management.Automation.PSCredential]$Credential
     )
 
     Begin {
         Write-Verbose "Begin $($MyInvocation.MyCommand)"
+        [ScriptBlock]$GetEvents = {
+            #Event 41 = The system has rebooted without cleanly shutting down first.
+            Get-WinEvent -FilterHashtable @{Logname = 'System'; ID = 41 } -MaxEvents 1 -ErrorAction SilentlyContinue
+            #Event 6008 = The previous system shutdown was unexpected.
+            Get-WinEvent -FilterHashtable @{Logname = 'System'; ID = 6008 } -MaxEvents 1 -ErrorAction SilentlyContinue
+            #Event 1074 = Normal Restart
+            Get-WinEvent -FilterHashtable @{Logname = 'System'; ID = 1074 } -MaxEvents 1 -ErrorAction SilentlyContinue
+        }
     }
 
     Process {
         foreach ($Computer in $ComputerName) {
+            $Downtime = [timespan]0
             Write-Verbose "Retrieving CIM data for $Computer"
-            $CIMData = Get-NRECACimInstance -ClassName win32_operatingsystem -ComputerName $Computer
+            if ($Credential) {
+                $CIMData = Get-CimInstance -ClassName win32_operatingsystem -ComputerName $Computer -Credential $Credential
+            } else {
+                $CIMData = Get-CimInstance -ClassName win32_operatingsystem -ComputerName $Computer
+            }
+
             Write-Verbose "Querying event log for $Computer for shutdown events."
-            try {
-                $LastShutdownEvent = Invoke-Command -ComputerName $Computer -ErrorAction Stop -ScriptBlock {
-                    $EventList = @()
-                    #The system has rebooted without cleanly shutting down first.
-                    $EventList += Get-WinEvent -FilterHashtable @{Logname = 'System'; ID = 41 }  -MaxEvents 1 -ErrorAction SilentlyContinue
-                    #The previous system shutdown  was unexpected.
-                    $EventList += Get-WinEvent -FilterHashtable @{Logname = 'System'; ID = 6008 }  -MaxEvents 1 -ErrorAction SilentlyContinue
-                    #Normal Restart
-                    $EventList += Get-WinEvent -FilterHashtable @{Logname = 'System'; ID = 1074 }  -MaxEvents 1 -ErrorAction SilentlyContinue
-                    ($EventList | Sort-Object -Property timecreated -Descending -ErrorAction Stop)[0]
-                }
+            If ($Credential) {
+                $EventList = @(Invoke-Command -ComputerName $Computer -ErrorAction Stop -ScriptBlock @GetEvents -Credential $Credential)
+            } else {
+                $EventList = @(Invoke-Command -ComputerName $Computer -ErrorAction Stop -ScriptBlock @GetEvents)
+            }
+
+            If ($EventList.count -gt 0) {
                 Write-Verbose "Calculating downtime"
+                $LastShutdownEvent = ($EventList | Sort-Object -Property timecreated -Descending -ErrorAction Stop)[0]
                 $LastShutdownTime = $LastShutdownEvent.timecreated
                 switch ($LastShutdownEvent.Id) {
                     41 { $LastShutdownType = "Unexpected" }
                     6008 { $LastShutdownType = "Unexpected" }
-                    1074 { $LastShutdownType = "Normal" }
+                    1074 {
+                        $LastShutdownType = "Normal" 
+                        $Downtime = $CIMData.LastBootUpTime - $LastShutdownTime
+                    }
                     Default { $LastShutdownType = "Unknown" }
                 }
-                $Downtime = $CIMData.LastBootUpTime - $LastShutdownTime
-            }
-            catch {
+            } else {
                 Write-Verbose "Unable to acquire shutdown data from event log"
                 $LastShutdownTime = [datetime]"1/1/1900"
                 $LastShutdownType = "Unknown"
-                $Downtime = [timespan]0
             }
-            
+
             Write-Verbose "Compiling output data for $Computer"
             $Result = [pscustomobject]@{
-                PSTypeName       = 'NRECA.LastBoot'
-                ComputerName     = $Computer
+                PSTypeName       = 'LastBoot'
+                ComputerName     = $CIMData.CSName
                 LastShutdownTime = $LastShutdownTime
                 Downtime         = $Downtime
                 DowntimeDays     = $Downtime.ToString("dd\.hh\:mm\:ss")
